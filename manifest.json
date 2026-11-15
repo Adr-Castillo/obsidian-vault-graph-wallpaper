@@ -1,0 +1,9 @@
+{
+  "id": "graph-wallpaper",
+  "name": "Graph Wallpaper",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Use your live graph view as the desktop wallpaper on Linux (X11).",
+  "author": "Apollo",
+  "isDesktopOnly": true
+}

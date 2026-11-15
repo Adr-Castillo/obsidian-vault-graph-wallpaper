@@ -1,0 +1,7 @@
+# Per-vault/per-machine plugin state — never part of the plugin itself
+data.json
+
+# Node tooling, if ever added
+node_modules/
+*.log
+.DS_Store
