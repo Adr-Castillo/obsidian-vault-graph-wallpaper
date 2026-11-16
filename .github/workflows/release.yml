@@ -1,0 +1,28 @@
+# Attaches the plugin files to a GitHub release whenever a version tag is pushed,
+# so installing or submitting to the Obsidian community catalogue is a one-liner:
+#   git tag 0.1.0 && git push origin 0.1.0
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release with plugin files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            main.js manifest.json styles.css \
+            --title "$TAG" \
+            --notes "Graph Wallpaper $TAG. Install by copying main.js, manifest.json and styles.css into <vault>/.obsidian/plugins/graph-wallpaper/."

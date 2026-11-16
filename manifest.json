@@ -5,5 +5,6 @@
   "minAppVersion": "1.5.0",
   "description": "Use your live graph view as the desktop wallpaper on Linux (X11).",
   "author": "Apollo",
+  "authorUrl": "https://github.com/Adr-Castillo",
   "isDesktopOnly": true
 }

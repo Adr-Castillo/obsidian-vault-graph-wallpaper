@@ -2,6 +2,8 @@
 
 Use your live Obsidian graph view as the desktop wallpaper on Linux (X11).
 
+![The graph wallpaper: an Obsidian graph over a starfield and lunar horizon](docs/screenshot.jpg)
+
 The wallpaper is a real Obsidian popout window showing the real graph view, so it has the same filters, colour groups, theme, CSS snippets and plugins as any other graph tab, and it updates as the vault changes. The plugin strips the window chrome and asks the window manager to treat the window as part of the desktop (`_NET_WM_WINDOW_TYPE_DESKTOP`), which puts it under every other window on every workspace.
 
 ## Requirements
