@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * Graph Wallpaper — pins a popout of the real graph view to the X11 desktop layer.
+ * Vault Graph Wallpaper — pins a popout of the real graph view to the X11 desktop layer.
  *
  * The popout is an ordinary Obsidian window, so the graph is the live one: same
  * filters, colour groups, theme, snippets and plugins as any other graph tab.
@@ -11,22 +11,22 @@
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, TFile } = require('obsidian');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const WINDOW_CLASS = 'graph-wallpaper-window';
-const IMAGE_CLASS = 'graph-wallpaper-has-image';
+const WINDOW_CLASS = 'vault-graph-wallpaper-window';
+const IMAGE_CLASS = 'vault-graph-wallpaper-has-image';
 const UPKEEP_INTERVAL_MS = 10000;
 // Frameless Electron windows on Linux have rounded corners; push them just past the screen edge.
 const OVERSCAN_PX = 8;
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 // Set by the login launcher, so only a login start (never a manual one) minimises the main window.
-const AUTOSTART_ENV = 'GRAPH_WALLPAPER_AUTOSTART';
+const AUTOSTART_ENV = 'VAULT_GRAPH_WALLPAPER_AUTOSTART';
 // Per-node state for the cursor gravity effect, stored on the graph's own node objects.
-const FIELD = 'graphWallpaperField';
+const FIELD = 'vaultGraphWallpaperField';
 
 // Drives a smooth animation at the display's own refresh rate. Calls step(dt) each frame, where
 // dt is seconds since the previous frame, and stops as soon as step returns false. The work each
@@ -131,7 +131,7 @@ def message(win, name, *data):
 def server_time():
     probe = X.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0)
     X.XSelectInput(dpy, probe, 1 << 22)
-    X.XChangeProperty(dpy, probe, atom("_GRAPH_WALLPAPER_TIME"), 31, 8, 2, None, 0)
+    X.XChangeProperty(dpy, probe, atom("_VAULT_GRAPH_WALLPAPER_TIME"), 31, 8, 2, None, 0)
     ev = XEvent()
     for _ in range(50):
         X.XNextEvent(dpy, byref(ev))
@@ -226,6 +226,96 @@ function x11(commands, xid) {
     });
   });
 }
+
+// Windows helper (experimental). PowerShell with inline C# re-parents our window into the layer
+// behind the desktop icons — the standard "WorkerW" technique that live-wallpaper tools use, and
+// the only way to reach the desktop layer on Windows, since there is no desktop window type.
+// This is an independent implementation of that public technique. The window ends up behind the
+// icons, which receive the mouse, so on Windows the wallpaper is display-only (no cursor gravity).
+// The helper stays running: it re-pins the window if Explorer restarts, and restores it to a
+// normal window when its stdin closes (the plugin stops it or Obsidian quits).
+const WINDOWS_HELPER = String.raw`
+param([Parameter(Mandatory = $true)][string]$Hwnd)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class VGW {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr FindWindow(string c, string n);
+    [DllImport("user32.dll")] static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string n);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
+    [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr c, IntPtr p);
+    [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int ht, uint f);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+
+    // Measure in real screen pixels: prefer per-monitor-v2, fall back to the old system-DPI call.
+    public static void UsePhysicalPixels() {
+        try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return; } catch {}
+        try { SetProcessDPIAware(); } catch {}
+    }
+
+    const int GWL_STYLE = -16, SW_RESTORE = 9, SM_CXSCREEN = 0, SM_CYSCREEN = 1;
+    const long WS_CHILD = 0x40000000L, WS_POPUP = unchecked((long)0x80000000L), WS_CAPTION = 0x00C00000L,
+               WS_THICKFRAME = 0x00040000L, WS_MINIMIZEBOX = 0x00020000L, WS_MAXIMIZEBOX = 0x00010000L, WS_SYSMENU = 0x00080000L;
+    const uint SWP_SHOWWINDOW = 0x40, SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20;
+
+    public static IntPtr Host = IntPtr.Zero;
+    static long OriginalStyle = 0;
+
+    static IntPtr FindWorkerW() {
+        IntPtr progman = FindWindow("Progman", null);
+        IntPtr res;
+        // Tell Explorer to spawn the WorkerW that hosts the wallpaper beneath the icon layer.
+        SendMessageTimeout(progman, 0x052C, IntPtr.Zero, IntPtr.Zero, 0x0, 1000, out res);
+        IntPtr worker = IntPtr.Zero;
+        EnumWindows((hwnd, l) => {
+            if (FindWindowEx(hwnd, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
+                worker = FindWindowEx(IntPtr.Zero, hwnd, "WorkerW", null);
+            return true;
+        }, IntPtr.Zero);
+        return worker != IntPtr.Zero ? worker : progman;
+    }
+
+    public static void Pin(string s) {
+        IntPtr hwnd = new IntPtr(long.Parse(s));
+        if (OriginalStyle == 0) OriginalStyle = GetWindowLongPtr(hwnd, GWL_STYLE).ToInt64();
+        ShowWindow(hwnd, SW_RESTORE);
+        Host = FindWorkerW();
+        long child = (OriginalStyle & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_CHILD;
+        SetWindowLongPtr(hwnd, GWL_STYLE, new IntPtr(child));
+        SetParent(hwnd, Host);
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+
+    public static void Release(string s) {
+        IntPtr hwnd = new IntPtr(long.Parse(s));
+        SetParent(hwnd, IntPtr.Zero);
+        if (OriginalStyle != 0) SetWindowLongPtr(hwnd, GWL_STYLE, new IntPtr(OriginalStyle));
+        SetWindowPos(hwnd, IntPtr.Zero, 120, 120, 1280, 800, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    }
+
+    public static bool Alive(string s) { return IsWindow(new IntPtr(long.Parse(s))); }
+    public static bool Strayed(string s) { return GetParent(new IntPtr(long.Parse(s))) != Host; }
+}
+'@
+[VGW]::UsePhysicalPixels()
+[VGW]::Pin($Hwnd)
+$stop = [Console]::In.ReadLineAsync()
+while ([VGW]::Alive($Hwnd) -and -not $stop.Wait(2000)) {
+    if ([VGW]::Strayed($Hwnd)) { [VGW]::Pin($Hwnd) }  # Explorer restarted; re-pin into the new WorkerW.
+}
+if ([VGW]::Alive($Hwnd)) { [VGW]::Release($Hwnd) }
+`;
 
 function electronRemote() {
   const electron = require('electron');
@@ -486,9 +576,10 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
 
     this.registerInterval(window.setInterval(() => this.upkeep(), UPKEEP_INTERVAL_MS));
 
-    if (this.isSupported()) {
+    if (this.isLinux) {
+      // Login autostart is wired through XDG files, so it is Linux-only for now.
       this.minimiseIfLoginStart();
-      this.syncLoginStart().catch((err) => console.error('Graph Wallpaper: login start', err));
+      this.syncLoginStart().catch((err) => console.error('Vault Graph Wallpaper: login start', err));
     }
 
     this.app.workspace.onLayoutReady(async () => {
@@ -509,7 +600,16 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   }
 
   isSupported() {
-    return process.platform === 'linux' && !!process.env.DISPLAY;
+    if (process.platform === 'linux') return !!process.env.DISPLAY;
+    return process.platform === 'win32';
+  }
+
+  get isLinux() {
+    return process.platform === 'linux';
+  }
+
+  get isWindows() {
+    return process.platform === 'win32';
   }
 
   /* ---------- lifecycle ---------- */
@@ -518,11 +618,11 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   async start(existingLeaf) {
     if (this.leaf || this.busy) return;
     if (!this.isSupported()) {
-      new Notice('Graph Wallpaper needs Linux with an X11 display.');
+      new Notice('Vault Graph Wallpaper needs Linux (X11) or Windows.');
       return;
     }
     if (!this.app.internalPlugins?.getPluginById?.('graph')?.enabled) {
-      new Notice('Graph Wallpaper: enable the core Graph view plugin first.');
+      new Notice('Vault Graph Wallpaper: enable the core Graph view plugin first.');
       return;
     }
     this.busy = true;
@@ -530,8 +630,8 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       const remote = electronRemote();
       const bounds = this.targetBounds(remote);
       const known = new Set(remote.BrowserWindow.getAllWindows().map((w) => w.id));
-      // A new window grabs keyboard focus; remember who had it so it can be handed back.
-      const focused = await x11(['active'], 0).catch(() => '0');
+      // A new window grabs keyboard focus; remember who had it so it can be handed back (X11 only).
+      const focused = this.isLinux ? await x11(['active'], 0).catch(() => '0') : '0';
 
       const leaf =
         existingLeaf ||
@@ -590,12 +690,14 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       this.hookNodeClicks();
       this.applyRenderOptions();
       await this.pinToDesktop(remote);
-      if (focused !== '0' && focused !== this.windowId()) await x11(['activate'], focused).catch(() => {});
-      else await x11(['focus-other'], this.windowId()).catch(() => {});
+      if (this.isLinux) {
+        if (focused !== '0' && focused !== this.windowId()) await x11(['activate'], focused).catch(() => {});
+        else await x11(['focus-other'], this.windowId()).catch(() => {});
+      }
       this.fitWhenSettled();
     } catch (err) {
-      console.error('Graph Wallpaper:', err);
-      new Notice(`Graph Wallpaper failed: ${err.message}`);
+      console.error('Vault Graph Wallpaper:', err);
+      new Notice(`Vault Graph Wallpaper failed: ${err.message}`);
       await this.stop();
     } finally {
       this.busy = false;
@@ -607,7 +709,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const leaf = this.leaf;
     this.forget();
     if (!leaf) return;
-    const focused = keepFocus ? await x11(['active'], 0).catch(() => '0') : '0';
+    const focused = keepFocus && this.isLinux ? await x11(['active'], 0).catch(() => '0') : '0';
     leaf.detach();
     if (focused === '0') return;
     await sleep(250);
@@ -616,6 +718,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   }
 
   forget() {
+    this.stopWindowsHelper();
     this.leaf = null;
     this.browserWindow = null;
     this.cursor = null;
@@ -662,19 +765,22 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   // Follow resolution and monitor changes, and keep the graph framed as the vault grows.
   upkeep() {
     if (!this.leaf || !this.browserWindow || this.busy) return;
-    try {
-      // Safety net: a wallpaper that somehow got minimised puts itself back.
-      if (this.browserWindow.isMinimized()) {
-        this.browserWindow.restore();
-        this.applyStacking()
-          .then(() => x11(['focus-other'], this.windowId()))
-          .catch((err) => console.debug('Graph Wallpaper: restore', err));
+    // On Windows the helper process owns the window's geometry and stacking; only drive them on X11.
+    if (this.isLinux) {
+      try {
+        // Safety net: a wallpaper that somehow got minimised puts itself back.
+        if (this.browserWindow.isMinimized()) {
+          this.browserWindow.restore();
+          this.applyStacking()
+            .then(() => x11(['focus-other'], this.windowId()))
+            .catch((err) => console.debug('Vault Graph Wallpaper: restore', err));
+        }
+        const want = this.windowBounds(electronRemote());
+        const have = this.browserWindow.getBounds();
+        if (['x', 'y', 'width', 'height'].some((key) => want[key] !== have[key])) this.browserWindow.setBounds(want);
+      } catch (err) {
+        console.debug('Vault Graph Wallpaper: bounds check skipped', err);
       }
-      const want = this.windowBounds(electronRemote());
-      const have = this.browserWindow.getBounds();
-      if (['x', 'y', 'width', 'height'].some((key) => want[key] !== have[key])) this.browserWindow.setBounds(want);
-    } catch (err) {
-      console.debug('Graph Wallpaper: bounds check skipped', err);
     }
     // A view the user zoomed or dragged eases back to the whole graph once they have left it alone.
     const idleFor = Date.now() - (this.lastPointerAt || 0);
@@ -691,7 +797,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     if (Date.now() - (this.lastStackingAt || 0) > SNAPSHOT_INTERVAL_MS) {
       this.lastStackingAt = Date.now();
       // The file manager may have restarted with a new desktop window.
-      this.applyStacking().catch((err) => console.debug('Graph Wallpaper: stacking', err));
+      this.applyStacking().catch((err) => console.debug('Vault Graph Wallpaper: stacking', err));
     }
     if (settled && this.settings.snapshotWallpaper && Date.now() - (this.lastSnapshotAt || 0) > SNAPSHOT_INTERVAL_MS) {
       // A skipped snapshot (graph busy, mouse on it) is simply retried on the next pass.
@@ -699,7 +805,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
         .then((saved) => {
           if (saved) this.lastSnapshotAt = Date.now();
         })
-        .catch((err) => console.error('Graph Wallpaper: snapshot', err));
+        .catch((err) => console.error('Vault Graph Wallpaper: snapshot', err));
     }
   }
 
@@ -734,14 +840,19 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       const own = popoutWindow.electronWindow || popoutWindow.require('electron').remote.getCurrentWindow();
       if (own && own.id !== remote.getCurrentWindow().id) return own;
     } catch (err) {
-      console.debug('Graph Wallpaper: popout has no direct window handle', err);
+      console.debug('Vault Graph Wallpaper: popout has no direct window handle', err);
     }
     const fresh = remote.BrowserWindow.getAllWindows().find((w) => !knownIds.has(w.id));
     if (!fresh) throw new Error('could not find the popout window');
     return fresh;
   }
 
+  // X11: the window id parsed from the media-source id. Windows: the native HWND as a decimal string.
   windowId() {
+    if (this.isWindows) {
+      const handle = this.browserWindow.getNativeWindowHandle();
+      return (handle.length >= 8 ? handle.readBigUInt64LE(0) : BigInt(handle.readUInt32LE(0))).toString();
+    }
     const match = /^window:(\d+):/.exec(this.browserWindow.getMediaSourceId());
     if (!match) throw new Error('could not read the X11 window id');
     return match[1];
@@ -749,12 +860,16 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
 
   async pinToDesktop(remote) {
     const win = this.browserWindow;
-    const xid = this.windowId();
     win.setMenuBarVisibility(false);
-    win.setHasShadow(false);
     win.setSkipTaskbar(true);
+    if (this.isWindows) {
+      // Windows has no desktop window type; a helper re-parents the window behind the icons instead.
+      await this.startWindowsHelper();
+      return;
+    }
+    win.setHasShadow(false);
     win.setFocusable(false);
-    await x11(['desktop', 'nofocus'], xid);
+    await x11(['desktop', 'nofocus'], this.windowId());
     // The window manager re-evaluates the window when its type changes, so set the rest afterwards.
     await sleep(150);
     win.setVisibleOnAllWorkspaces(true);
@@ -764,9 +879,53 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
 
   // Desktop icons are drawn by the file manager in its own desktop-type window.
   // Below it: icons stay usable and the graph is click-through. Above it: the graph is interactive.
+  // Windows has no equivalent — the helper always sits behind the icons — so this is X11 only.
   async applyStacking() {
-    if (!this.browserWindow) return;
+    if (!this.browserWindow || !this.isLinux) return;
     await x11([this.settings.iconsOnTop ? 'below-icons' : 'above-icons'], this.windowId());
+  }
+
+  // Writes the PowerShell helper into the plugin's data folder and runs it, keeping it alive by
+  // holding its stdin open. The window stays pinned behind the icons until stopWindowsHelper ends it.
+  async startWindowsHelper() {
+    this.stopWindowsHelper();
+    const hwnd = this.windowId();
+    const file = path.join(this.dataDir(), 'wallpaper-helper.ps1');
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(file, WINDOWS_HELPER);
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-Hwnd', hwnd],
+      { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true }
+    );
+    this.winHelper = child;
+    child.stderr?.on('data', (d) => console.error('Vault Graph Wallpaper helper:', String(d).trim()));
+    child.on('error', (err) => {
+      console.error('Vault Graph Wallpaper: could not run the Windows helper', err);
+      new Notice('Vault Graph Wallpaper: could not start the Windows helper (PowerShell).');
+    });
+    child.on('exit', () => {
+      if (this.winHelper === child) this.winHelper = null;
+    });
+  }
+
+  // Closing stdin tells the helper to restore the window and exit; kill it if it lingers.
+  stopWindowsHelper() {
+    const child = this.winHelper;
+    this.winHelper = null;
+    if (!child) return;
+    try {
+      child.stdin?.end();
+    } catch (err) {
+      console.debug('Vault Graph Wallpaper: helper stdin already closed', err);
+    }
+    setTimeout(() => {
+      try {
+        child.kill();
+      } catch (err) {
+        console.debug('Vault Graph Wallpaper: helper already gone', err);
+      }
+    }, 2500);
   }
 
   /* ---------- picture behind the graph ---------- */
@@ -802,19 +961,19 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       if (this.leaf?.getContainer() !== container) return;
       if (this.backgroundUrl) URL.revokeObjectURL(this.backgroundUrl);
       this.backgroundUrl = URL.createObjectURL(blob);
-      body.style.setProperty('--graph-wallpaper-image', `url("${this.backgroundUrl}")`);
+      body.style.setProperty('--vault-graph-wallpaper-image', `url("${this.backgroundUrl}")`);
       this.applyBackgroundShading();
       body.classList.add(IMAGE_CLASS);
     } catch (err) {
       body.classList.remove(IMAGE_CLASS);
-      console.error('Graph Wallpaper: background', err);
-      new Notice(`Graph Wallpaper: could not load the background (${err.message})`);
+      console.error('Vault Graph Wallpaper: background', err);
+      new Notice(`Vault Graph Wallpaper: could not load the background (${err.message})`);
     }
   }
 
   applyBackgroundShading() {
     const style = this.leaf?.getContainer()?.doc?.body?.style;
-    if (style) style.setProperty('--graph-wallpaper-dim', String(this.settings.backgroundDim));
+    if (style) style.setProperty('--vault-graph-wallpaper-dim', String(this.settings.backgroundDim));
   }
 
   // Node size for the wallpaper only. The graph's own settings stay as they are for every other
@@ -834,7 +993,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       });
       renderer.changed?.();
     } catch (err) {
-      console.debug('Graph Wallpaper: node size skipped', err);
+      console.debug('Vault Graph Wallpaper: node size skipped', err);
     }
   }
 
@@ -905,17 +1064,17 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   // shows a note. Relies on the renderer's click callback; guardWindow covers anything it misses.
   hookNodeClicks() {
     const renderer = this.leaf?.view?.renderer;
-    if (!renderer || renderer.graphWallpaperHooked || typeof renderer.onNodeClick !== 'function') return;
+    if (!renderer || renderer.vaultGraphWallpaperHooked || typeof renderer.onNodeClick !== 'function') return;
     const original = renderer.onNodeClick;
     renderer.onNodeClick = (event, id, type) => {
       const file = this.app.vault.getAbstractFileByPath(id);
       if (file instanceof TFile) {
-        this.openInMainWindow(file).catch((err) => console.error('Graph Wallpaper: open note', err));
+        this.openInMainWindow(file).catch((err) => console.error('Vault Graph Wallpaper: open note', err));
       } else {
         original(event, id, type);
       }
     };
-    renderer.graphWallpaperHooked = true;
+    renderer.vaultGraphWallpaperHooked = true;
   }
 
   async openInMainWindow(file) {
@@ -1060,7 +1219,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
         return false;
       }
     } catch (err) {
-      console.debug('Graph Wallpaper: cursor gravity stopped', err);
+      console.debug('Vault Graph Wallpaper: cursor gravity stopped', err);
       return (this.gravityRunning = false);
     }
   }
@@ -1082,14 +1241,14 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
         })
       );
     } catch (err) {
-      console.debug('Graph Wallpaper: hover refresh skipped', err);
+      console.debug('Vault Graph Wallpaper: hover refresh skipped', err);
     }
   }
 
   /* ---------- instant wallpaper at login ---------- */
 
   dataDir() {
-    return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'obsidian-graph-wallpaper');
+    return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'obsidian-vault-graph-wallpaper');
   }
 
   vaultSlug() {
@@ -1153,7 +1312,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const config = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
     return {
       launcher: path.join(this.dataDir(), `start-${this.vaultSlug()}.sh`),
-      entry: path.join(config, 'autostart', `obsidian-graph-wallpaper-${this.vaultSlug()}.desktop`),
+      entry: path.join(config, 'autostart', `obsidian-vault-graph-wallpaper-${this.vaultSlug()}.desktop`),
     };
   }
 
@@ -1170,7 +1329,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const binary = process.env.APPIMAGE || process.execPath;
     const script = [
       '#!/bin/sh',
-      '# Written by the Graph Wallpaper plugin for Obsidian. Turn off "Start Obsidian at login" to remove it.',
+      '# Written by the Vault Graph Wallpaper plugin for Obsidian. Turn off "Start Obsidian at login" to remove it.',
       `VAULT=${shellQuote(vault)}`,
       'tries=0',
       'while [ ! -d "$VAULT/.obsidian" ] && [ "$tries" -lt 180 ]; do sleep 1; tries=$((tries + 1)); done',
@@ -1181,7 +1340,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const desktop = [
       '[Desktop Entry]',
       'Type=Application',
-      `Name=Graph Wallpaper (${this.app.vault.getName()})`,
+      `Name=Vault Graph Wallpaper (${this.app.vault.getName()})`,
       'Comment=Start Obsidian minimised so the graph wallpaper is live',
       `Exec="${launcher.replace(/(["\\`$])/g, '\\$1')}"`,
       'NoDisplay=true',
@@ -1222,7 +1381,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       }
       electronRemote().getCurrentWindow().minimize();
     } catch (err) {
-      console.debug('Graph Wallpaper: could not minimise on login start', err);
+      console.debug('Vault Graph Wallpaper: could not minimise on login start', err);
     }
   }
 
@@ -1271,7 +1430,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       if (!force && scaleDrift < 0.05 && panDrift < 0.03) return;
       this.easeView(renderer, scale, panX, panY);
     } catch (err) {
-      console.debug('Graph Wallpaper: fit skipped', err);
+      console.debug('Vault Graph Wallpaper: fit skipped', err);
     }
   }
 };
@@ -1287,7 +1446,9 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     if (!plugin.isSupported()) {
-      containerEl.createEl('p', { text: 'Graph Wallpaper only works on Linux with an X11 display.' });
+      containerEl.createEl('p', {
+        text: 'Vault Graph Wallpaper works on Linux (X11) and Windows. This platform is not supported.',
+      });
       return;
     }
 
@@ -1307,21 +1468,33 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
-      .setName('Interactive')
-      .setDesc(
-        'Let the wallpaper respond to the mouse: zoom and drag the graph, click a node to open it, ' +
-          'and let the cursor bend nearby nodes. Off: the graph sits quietly behind your desktop icons ' +
-          'and uses no resources.'
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(interactive).onChange(async (value) => {
-          s.iconsOnTop = !value;
-          await plugin.saveSettings();
-          await plugin.applyStacking();
-          this.display(); // the motion settings only make sense when interactive
-        })
+    // Interactivity and cursor gravity need the window above the icon layer, which only X11 allows.
+    // On Windows the window sits behind the icons (which take the mouse), so it is display-only.
+    if (plugin.isWindows) {
+      const note = new Setting(containerEl).setName('Windows support is experimental').setDesc(
+        'The graph is shown behind your desktop icons and updates live, but it is display-only on ' +
+          'Windows — no cursor gravity, zoom or node clicks. Please report problems with your Windows version.'
       );
+      note.settingEl.style.opacity = '0.85';
+    }
+
+    if (plugin.isLinux) {
+      new Setting(containerEl)
+        .setName('Interactive')
+        .setDesc(
+          'Let the wallpaper respond to the mouse: zoom and drag the graph, click a node to open it, ' +
+            'and let the cursor bend nearby nodes. Off: the graph sits quietly behind your desktop icons ' +
+            'and uses no resources.'
+        )
+        .addToggle((toggle) =>
+          toggle.setValue(interactive).onChange(async (value) => {
+            s.iconsOnTop = !value;
+            await plugin.saveSettings();
+            await plugin.applyStacking();
+            this.display(); // the motion settings only make sense when interactive
+          })
+        );
+    }
 
     // --- Appearance ---
     new Setting(containerEl).setName('Appearance').setHeading();
@@ -1409,8 +1582,8 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
           })
       );
 
-    // --- Motion (only meaningful while interactive) ---
-    if (interactive) {
+    // --- Motion (only meaningful while interactive, which is X11-only) ---
+    if (plugin.isLinux && interactive) {
       new Setting(containerEl).setName('Motion').setHeading();
 
       new Setting(containerEl)
@@ -1461,44 +1634,46 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
         );
     }
 
-    // --- Startup ---
-    new Setting(containerEl).setName('Startup').setHeading();
+    // --- Startup (login autostart and system-wallpaper snapshot are X11-only for now) ---
+    if (plugin.isLinux) {
+      new Setting(containerEl).setName('Startup').setHeading();
 
-    new Setting(containerEl)
-      .setName('Launch Obsidian at login')
-      .setDesc('Open this vault at login with its window minimised, so the wallpaper comes up on its own.')
-      .addToggle((toggle) =>
-        toggle.setValue(s.loginStart).onChange(async (value) => {
-          s.loginStart = value;
-          await plugin.saveSettings();
-          await plugin.syncLoginStart();
-        })
-      );
+      new Setting(containerEl)
+        .setName('Launch Obsidian at login')
+        .setDesc('Open this vault at login with its window minimised, so the wallpaper comes up on its own.')
+        .addToggle((toggle) =>
+          toggle.setValue(s.loginStart).onChange(async (value) => {
+            s.loginStart = value;
+            await plugin.saveSettings();
+            await plugin.syncLoginStart();
+          })
+        );
 
-    new Setting(containerEl)
-      .setName('Show the graph while Obsidian is closed')
-      .setDesc(
-        wallpaperSetting()
-          ? 'Keep a picture of the graph as your system wallpaper, so the desktop shows it before Obsidian has loaded and whenever it is closed. Off puts your previous wallpaper back.'
-          : `Save a picture of the graph to ${plugin.snapshotPath()} — this desktop is not one the plugin can set automatically, so point your wallpaper at that file.`
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(s.snapshotWallpaper).onChange(async (value) => {
-          s.snapshotWallpaper = value;
-          await plugin.saveSettings();
-          if (value) await plugin.saveSnapshot();
-          else await plugin.restoreWallpaper();
-        })
-      );
+      new Setting(containerEl)
+        .setName('Show the graph while Obsidian is closed')
+        .setDesc(
+          wallpaperSetting()
+            ? 'Keep a picture of the graph as your system wallpaper, so the desktop shows it before Obsidian has loaded and whenever it is closed. Off puts your previous wallpaper back.'
+            : `Save a picture of the graph to ${plugin.snapshotPath()} — this desktop is not one the plugin can set automatically, so point your wallpaper at that file.`
+        )
+        .addToggle((toggle) =>
+          toggle.setValue(s.snapshotWallpaper).onChange(async (value) => {
+            s.snapshotWallpaper = value;
+            await plugin.saveSettings();
+            if (value) await plugin.saveSnapshot();
+            else await plugin.restoreWallpaper();
+          })
+        );
+    }
 
-    // --- Display (only worth showing with more than one monitor) ---
+    // --- Display (X11 only; the Windows helper always uses the primary monitor) ---
     let displays = [];
     try {
       displays = electronRemote().screen.getAllDisplays();
     } catch (err) {
-      console.debug('Graph Wallpaper: could not list displays', err);
+      console.debug('Vault Graph Wallpaper: could not list displays', err);
     }
-    if (displays.length > 1) {
+    if (plugin.isLinux && displays.length > 1) {
       new Setting(containerEl).setName('Display').setHeading();
       new Setting(containerEl)
         .setName('Monitor')

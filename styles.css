@@ -1,21 +1,21 @@
-/* Applied only to the popout window that Graph Wallpaper pins to the desktop. */
+/* Applied only to the popout window that Vault Graph Wallpaper pins to the desktop. */
 
-body.graph-wallpaper-window .titlebar,
-body.graph-wallpaper-window .workspace-tab-header-container,
-body.graph-wallpaper-window .view-header,
-body.graph-wallpaper-window .status-bar {
+body.vault-graph-wallpaper-window .titlebar,
+body.vault-graph-wallpaper-window .workspace-tab-header-container,
+body.vault-graph-wallpaper-window .view-header,
+body.vault-graph-wallpaper-window .status-bar {
   display: none !important;
 }
 
-body.graph-wallpaper-window .app-container,
-body.graph-wallpaper-window .horizontal-main-container,
-body.graph-wallpaper-window .workspace,
-body.graph-wallpaper-window .workspace-split,
-body.graph-wallpaper-window .workspace-tabs,
-body.graph-wallpaper-window .workspace-tab-container,
-body.graph-wallpaper-window .workspace-leaf,
-body.graph-wallpaper-window .workspace-leaf-content,
-body.graph-wallpaper-window .view-content {
+body.vault-graph-wallpaper-window .app-container,
+body.vault-graph-wallpaper-window .horizontal-main-container,
+body.vault-graph-wallpaper-window .workspace,
+body.vault-graph-wallpaper-window .workspace-split,
+body.vault-graph-wallpaper-window .workspace-tabs,
+body.vault-graph-wallpaper-window .workspace-tab-container,
+body.vault-graph-wallpaper-window .workspace-leaf,
+body.vault-graph-wallpaper-window .workspace-leaf-content,
+body.vault-graph-wallpaper-window .view-content {
   margin: 0 !important;
   padding: 0 !important;
   border: none !important;
@@ -23,19 +23,19 @@ body.graph-wallpaper-window .view-content {
 }
 
 /* The graph's own settings cog is useless on a wallpaper, so it is always hidden. */
-body.graph-wallpaper-window .graph-controls {
+body.vault-graph-wallpaper-window .graph-controls {
   display: none !important;
 }
 
 /* Optional picture behind the graph. The canvas is transparent, so it shows through.
    Layers, top first: a fixed edge vignette that seats the graph in the scene, the adjustable
    dimming, then the picture. */
-body.graph-wallpaper-window.graph-wallpaper-has-image .view-content {
+body.vault-graph-wallpaper-window.vault-graph-wallpaper-has-image .view-content {
   background-color: #000 !important;
   background-image:
     radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 40%, rgba(0, 0, 0, 0.45) 100%),
-    linear-gradient(rgba(0, 0, 0, var(--graph-wallpaper-dim, 0.2)), rgba(0, 0, 0, var(--graph-wallpaper-dim, 0.2))),
-    var(--graph-wallpaper-image) !important;
+    linear-gradient(rgba(0, 0, 0, var(--vault-graph-wallpaper-dim, 0.2)), rgba(0, 0, 0, var(--vault-graph-wallpaper-dim, 0.2))),
+    var(--vault-graph-wallpaper-image) !important;
   background-position: center !important;
   background-size: cover !important;
   background-repeat: no-repeat !important;

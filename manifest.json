@@ -1,9 +1,9 @@
 {
-  "id": "graph-wallpaper",
-  "name": "Graph Wallpaper",
+  "id": "vault-graph-wallpaper",
+  "name": "Vault Graph Wallpaper",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Use your live graph view as the desktop wallpaper on Linux (X11).",
+  "description": "Show your live graph view as the desktop wallpaper on Linux (X11) and Windows.",
   "author": "Apollo",
   "authorUrl": "https://github.com/Adr-Castillo",
   "isDesktopOnly": true
