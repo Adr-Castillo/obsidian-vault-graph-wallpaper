@@ -4,6 +4,8 @@ Use your live Obsidian graph view as the desktop wallpaper on Linux (X11).
 
 ![The graph wallpaper: an Obsidian graph over a starfield and lunar horizon](docs/screenshot.jpg)
 
+> **Linux (X11) only.** The live, interactive wallpaper relies on an X11 feature with no pure-JavaScript equivalent on macOS or Windows. A non-interactive snapshot mode for those platforms may come in a later version.
+
 The wallpaper is a real Obsidian popout window showing the real graph view, so it has the same filters, colour groups, theme, CSS snippets and plugins as any other graph tab, and it updates as the vault changes. The plugin strips the window chrome and asks the window manager to treat the window as part of the desktop (`_NET_WM_WINDOW_TYPE_DESKTOP`), which puts it under every other window on every workspace.
 
 ## Requirements
@@ -11,6 +13,7 @@ The wallpaper is a real Obsidian popout window showing the real graph view, so i
 - Linux with an X11 session and an EWMH window manager. Built and tested on Cinnamon (Muffin) with Obsidian 1.14 and 1.15.
 - `python3` with the system `libX11` (present on any X11 desktop). No other dependencies and no build step.
 - The core Graph view plugin enabled.
+- Not supported: Wayland sessions, macOS, or Windows (see the note above).
 
 ## Install
 
