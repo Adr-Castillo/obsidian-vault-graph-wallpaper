@@ -2,7 +2,7 @@
 
 Show your live Obsidian graph view as the desktop wallpaper, on Linux (X11) and Windows.
 
-![The graph wallpaper: an Obsidian graph over a starfield and lunar horizon](docs/screenshot.jpg)
+![Vault Graph Wallpaper: an Obsidian graph over a deep-space image](docs/screenshot.jpg)
 
 The wallpaper is a real Obsidian popout window showing the real graph view, so it has the same filters, colour groups, theme, CSS snippets and plugins as any other graph tab, and it updates as the vault changes. The plugin strips the window chrome and places the window on the desktop layer — under every other window, out of the taskbar and Alt+Tab.
 
@@ -29,7 +29,7 @@ Settings → Vault Graph Wallpaper (only the controls that apply to your setup a
 
 - **Show the graph wallpaper** — put your live graph on the desktop, now and whenever this vault opens.
 - **Interactive** — respond to the mouse (zoom, drag, click a node to open it, cursor gravity). Off: the graph sits behind your desktop icons and uses no resources.
-- **Appearance** — background (theme colour, the built-in space scene, or your own image), how much to dim it, node size, and how much of the screen the graph fills.
+- **Appearance** — background (your theme colour, or an image of your own), how much to dim it, node size, and how much of the screen the graph fills.
 - **Motion** (interactive only) — cursor gravity and its reach, and how long after you stop before a zoomed view eases back to the whole graph.
 - **Startup** — launch Obsidian at login (minimised), and keep a snapshot of the graph as your system wallpaper so the desktop shows it before Obsidian loads and while it is closed.
 - **Display** (multi-monitor only) — which screen the graph covers.

@@ -49,7 +49,7 @@ const DEFAULT_SETTINGS = {
   iconsOnTop: true, // true = sit behind the desktop icons and ignore the mouse (the lightweight default)
   fitPadding: 0.08,
   leafId: null,
-  background: 'space', // 'theme' | 'space' | 'image'
+  background: 'theme', // 'theme' | 'image'
   backgroundImage: '',
   backgroundDim: 0.2,
   nodeSize: 1,
@@ -344,193 +344,6 @@ function wallpaperSetting() {
   return null;
 }
 
-/* ---------- built-in space backdrop (drawn, not downloaded) ---------- */
-// <space-backdrop>
-
-// Deterministic pseudo-random numbers, so the sky is the same on every start.
-function seededRandom(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// Deep sky, a faint galactic band, stars, and a lunar horizon along the bottom edge.
-// Everything stays dark and low-contrast so graph nodes read as the brightest things in the scene.
-function drawSpaceBackdrop(canvas) {
-  const w = canvas.width, h = canvas.height;
-  const ctx = canvas.getContext('2d');
-  const random = seededRandom(20261115);
-  const unit = Math.max(w, h) / 1920;
-  const gaussian = () => (random() + random() + random() + random() - 2) / 2;
-
-  const sky = ctx.createLinearGradient(0, 0, 0, h);
-  sky.addColorStop(0, '#010208');
-  sky.addColorStop(0.6, '#040714');
-  sky.addColorStop(1, '#070b1a');
-  ctx.fillStyle = sky;
-  ctx.fillRect(0, 0, w, h);
-
-  // Nebula haze: a few very large, very faint colour clouds.
-  ctx.globalCompositeOperation = 'lighter';
-  const clouds = [
-    [0.2, 0.28, 0.52, '36,64,150'],
-    [0.76, 0.22, 0.46, '92,48,140'],
-    [0.56, 0.6, 0.58, '18,84,108'],
-    [0.08, 0.8, 0.38, '70,38,112'],
-    [0.92, 0.72, 0.42, '28,56,128'],
-  ];
-  for (const [x, y, r, rgb] of clouds) {
-    const g = ctx.createRadialGradient(x * w, y * h, 0, x * w, y * h, r * w);
-    g.addColorStop(0, `rgba(${rgb},0.15)`);
-    g.addColorStop(0.5, `rgba(${rgb},0.06)`);
-    g.addColorStop(1, `rgba(${rgb},0)`);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, w, h);
-  }
-
-  // Stars. Part of the faint ones gather along a diagonal band, like a galaxy seen edge-on.
-  const bandPoint = () => {
-    const t = random();
-    const spread = gaussian() * 0.11;
-    return [t * 1.2 - 0.1 + spread * 0.45, 0.82 - t * 0.74 + spread];
-  };
-  const tints = ['255,255,255', '205,220,255', '255,238,214', '190,205,255'];
-  const faint = Math.round((w * h) / 620);
-  for (let i = 0; i < faint; i++) {
-    const [x, y] = random() < 0.5 ? bandPoint() : [random(), random()];
-    const size = (0.35 + random() * 0.75) * unit;
-    ctx.fillStyle = `rgba(${tints[(random() * tints.length) | 0]},${0.1 + random() * 0.4})`;
-    ctx.fillRect(x * w, y * h, size, size);
-  }
-  const medium = Math.round((w * h) / 16000);
-  for (let i = 0; i < medium; i++) {
-    const x = random() * w, y = random() * h, r = (0.6 + random() * 0.7) * unit;
-    ctx.fillStyle = `rgba(${tints[(random() * tints.length) | 0]},${0.45 + random() * 0.4})`;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  for (let i = 0; i < 16; i++) {
-    const x = random() * w, y = random() * h * 0.8, r = (1.1 + random() * 0.8) * unit;
-    const tint = tints[(random() * tints.length) | 0];
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, r * 7);
-    glow.addColorStop(0, `rgba(${tint},0.5)`);
-    glow.addColorStop(0.25, `rgba(${tint},0.1)`);
-    glow.addColorStop(1, `rgba(${tint},0)`);
-    ctx.fillStyle = glow;
-    ctx.fillRect(x - r * 7, y - r * 7, r * 14, r * 14);
-    ctx.fillStyle = `rgba(${tint},0.95)`;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.globalCompositeOperation = 'source-over';
-
-  // Lunar horizon: the top of a very large sphere, lit from the upper left.
-  const radius = w * 2.4;
-  const rise = h * 0.2;
-  const cx = w * 0.5, cy = h + radius - rise;
-  const horizon = () => {
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, Math.PI * 1.2, Math.PI * 1.8);
-  };
-  // Soft glow hugging the limb, drawn first so the surface covers its inner half.
-  ctx.save();
-  ctx.shadowColor = 'rgba(140,165,230,0.6)';
-  ctx.shadowBlur = 26 * unit;
-  ctx.strokeStyle = 'rgba(140,165,230,0.35)';
-  ctx.lineWidth = 2 * unit;
-  horizon();
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-  ctx.clip();
-  const ground = ctx.createLinearGradient(0, h - rise, 0, h);
-  ground.addColorStop(0, '#5a5d66');
-  ground.addColorStop(0.12, '#3a3c44');
-  ground.addColorStop(0.5, '#1d1e24');
-  ground.addColorStop(1, '#0c0d11');
-  ctx.fillStyle = ground;
-  ctx.fillRect(0, h - rise - 2, w, rise + 4);
-  // Light falls off to the right, away from the sun.
-  const falloff = ctx.createLinearGradient(0, 0, w, 0);
-  falloff.addColorStop(0, 'rgba(0,0,0,0)');
-  falloff.addColorStop(1, 'rgba(0,0,0,0.55)');
-  ctx.fillStyle = falloff;
-  ctx.fillRect(0, h - rise - 2, w, rise + 4);
-  const surfaceTop = (x) => cy - Math.sqrt(Math.max(radius * radius - (x - cx) * (x - cx), 0));
-  // Maria: a few broad, soft, darker plains.
-  for (let i = 0; i < 6; i++) {
-    const x = random() * w;
-    const top = surfaceTop(x);
-    const y = top + (h - top) * (0.25 + random() * 0.7);
-    const rx = (140 + random() * 260) * unit, ry = rx * (0.14 + random() * 0.12);
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.scale(1, ry / rx);
-    const sea = ctx.createRadialGradient(0, 0, 0, 0, 0, rx);
-    sea.addColorStop(0, 'rgba(0,0,0,0.3)');
-    sea.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = sea;
-    ctx.fillRect(-rx, -rx, rx * 2, rx * 2);
-    ctx.restore();
-  }
-  // Regolith grain.
-  for (let i = 0; i < (w * rise) / 22; i++) {
-    const x = random() * w, y = h - random() * rise;
-    ctx.fillStyle = random() < 0.5 ? `rgba(255,255,255,${0.02 + random() * 0.05})` : `rgba(0,0,0,${0.05 + random() * 0.12})`;
-    ctx.fillRect(x, y, unit * (0.6 + random()), unit * (0.6 + random()));
-  }
-  // Craters, flattened by perspective: flatter near the horizon, rounder near the viewer.
-  // The wall nearest the sun is in shadow; the far wall catches the light.
-  for (let i = 0; i < 38; i++) {
-    const x = random() * w;
-    const top = surfaceTop(x);
-    const depth = Math.pow(random(), 1.5);
-    const y = top + (h - top) * (0.07 + depth * 0.93);
-    const rx = (5 + Math.pow(random(), 2.2) * 58) * unit * (0.35 + depth * 0.9);
-    const ry = rx * (0.15 + depth * 0.3);
-    const strength = 0.55 + random() * 0.45;
-    ctx.save();
-    ctx.beginPath();
-    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.fillStyle = `rgba(8,9,12,${0.28 * strength})`;
-    ctx.fillRect(x - rx, y - ry, rx * 2, ry * 2);
-    ctx.fillStyle = `rgba(0,0,0,${0.5 * strength})`;
-    ctx.beginPath();
-    ctx.ellipse(x - rx * 0.34, y - ry * 0.22, rx * 0.95, ry * 0.95, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-    ctx.lineWidth = Math.max(1, unit * (0.8 + rx * 0.025));
-    ctx.strokeStyle = `rgba(226,230,240,${0.26 * strength})`;
-    ctx.beginPath();
-    ctx.ellipse(x, y, rx, ry, 0, -Math.PI * 0.2, Math.PI * 0.62);
-    ctx.stroke();
-    ctx.strokeStyle = `rgba(0,0,0,${0.3 * strength})`;
-    ctx.beginPath();
-    ctx.ellipse(x, y, rx * 1.04, ry * 1.08, 0, Math.PI * 0.8, Math.PI * 1.62);
-    ctx.stroke();
-  }
-  ctx.restore();
-  // Sunlit limb, brightest toward the sun.
-  const edge = ctx.createLinearGradient(0, 0, w, 0);
-  edge.addColorStop(0, 'rgba(232,236,248,0.75)');
-  edge.addColorStop(0.6, 'rgba(214,220,236,0.4)');
-  edge.addColorStop(1, 'rgba(180,190,215,0.14)');
-  ctx.strokeStyle = edge;
-  ctx.lineWidth = Math.max(1, unit * 1.3);
-  horizon();
-  ctx.stroke();
-}
-// </space-backdrop>
 
 const shellQuote = (text) => `'${String(text).replace(/'/g, `'\\''`)}'`;
 
@@ -931,8 +744,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   /* ---------- picture behind the graph ---------- */
 
   backgroundMode() {
-    if (this.settings.background) return this.settings.background;
-    return (this.settings.backgroundImage || '').trim() ? 'image' : 'theme';
+    return this.settings.background === 'image' && (this.settings.backgroundImage || '').trim() ? 'image' : 'theme';
   }
 
   // The graph canvas is transparent, so a picture on the element behind it shows through.
@@ -940,24 +752,15 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const container = this.leaf?.getContainer();
     const body = container?.doc?.body;
     if (!body) return;
-    const mode = this.backgroundMode();
-    if (mode === 'theme') {
+    if (this.backgroundMode() !== 'image') {
       body.classList.remove(IMAGE_CLASS);
       return;
     }
     try {
       const ratio = container.win.devicePixelRatio || 1;
-      let blob;
-      if (mode === 'space') {
-        const bounds = this.windowBounds(electronRemote());
-        const canvas = new OffscreenCanvas(Math.round(bounds.width * ratio), Math.round(bounds.height * ratio));
-        drawSpaceBackdrop(canvas);
-        blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.93 });
-      } else {
-        const file = (this.settings.backgroundImage || '').trim().replace(/^~(?=\/)/, os.homedir());
-        if (!file) throw new Error('no image file chosen');
-        blob = new Blob([await this.scaledBackground(file, ratio)], { type: 'image/jpeg' });
-      }
+      const file = (this.settings.backgroundImage || '').trim().replace(/^~(?=\/)/, os.homedir());
+      if (!file) throw new Error('no image file chosen');
+      const blob = new Blob([await this.scaledBackground(file, ratio)], { type: 'image/jpeg' });
       if (this.leaf?.getContainer() !== container) return;
       if (this.backgroundUrl) URL.revokeObjectURL(this.backgroundUrl);
       this.backgroundUrl = URL.createObjectURL(blob);
@@ -1422,12 +1225,9 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       const width = renderer.width * ratio, height = renderer.height * ratio;
       if (!width || !height) return;
       const pad = 1 - 2 * this.settings.fitPadding;
-      // The space scene has ground along the bottom; frame the graph in the sky above it.
-      const ground = this.backgroundMode() === 'space' ? 0.1 : 0;
-      const sky = height * (1 - ground);
-      const scale = Math.min((width * pad) / Math.max(maxX - minX, 1), (sky * pad) / Math.max(maxY - minY, 1));
+      const scale = Math.min((width * pad) / Math.max(maxX - minX, 1), (height * pad) / Math.max(maxY - minY, 1));
       const panX = width / 2 - ((minX + maxX) / 2) * scale;
-      const panY = sky / 2 - ((minY + maxY) / 2) * scale;
+      const panY = height / 2 - ((minY + maxY) / 2) * scale;
       const scaleDrift = Math.abs(scale / renderer.scale - 1);
       const panDrift = Math.max(Math.abs(panX - renderer.panX) / width, Math.abs(panY - renderer.panY) / height);
       if (!force && scaleDrift < 0.05 && panDrift < 0.03) return;
@@ -1504,11 +1304,10 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Background')
-      .setDesc('What sits behind the graph.')
+      .setDesc('What sits behind the graph: your theme colour, or an image of your own.')
       .addDropdown((dropdown) =>
         dropdown
           .addOption('theme', 'Theme colour')
-          .addOption('space', 'Space')
           .addOption('image', 'Your image')
           .setValue(plugin.backgroundMode())
           .onChange(async (value) => {
