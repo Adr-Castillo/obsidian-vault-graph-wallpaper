@@ -1248,7 +1248,10 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   /* ---------- instant wallpaper at login ---------- */
 
   dataDir() {
-    return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'obsidian-vault-graph-wallpaper');
+    const base = this.isWindows
+      ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+      : process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+    return path.join(base, 'obsidian-vault-graph-wallpaper');
   }
 
   vaultSlug() {
