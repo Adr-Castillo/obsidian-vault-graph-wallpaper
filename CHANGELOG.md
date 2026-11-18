@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Windows starts with a transparent, live graph over the existing desktop wallpaper on the primary display.
+- Windows adds cursor gravity, node hover, click-to-open, wheel zoom, middle-button pan, and Shift + middle-drag to move between displays.
+- The monitor preference is saved per vault. Previously selected theme or image backgrounds keep their settings and gain Windows mouse controls.
+- Windows caps graph painting at 30 FPS during interaction. The spring simulation stops once the graph settles.
+- Requires Obsidian 1.15.1. The 0.1.0 release remains available for earlier versions.
+
 ## 0.1.0
 
 First release.

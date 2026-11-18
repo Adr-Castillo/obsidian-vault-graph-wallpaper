@@ -27,6 +27,22 @@ body.vault-graph-wallpaper-window .graph-controls {
   display: none !important;
 }
 
+/* Allow the desktop to show through the native transparent popout on Windows. */
+html:has(> body.vault-graph-wallpaper-desktop-background),
+body.vault-graph-wallpaper-desktop-background,
+body.vault-graph-wallpaper-desktop-background .workspace-leaf-content,
+body.vault-graph-wallpaper-desktop-background .view-content,
+body.vault-graph-wallpaper-desktop-background .app-container,
+body.vault-graph-wallpaper-desktop-background .horizontal-main-container,
+body.vault-graph-wallpaper-desktop-background .workspace,
+body.vault-graph-wallpaper-desktop-background .workspace-split,
+body.vault-graph-wallpaper-desktop-background .workspace-tabs,
+body.vault-graph-wallpaper-desktop-background .workspace-tab-container,
+body.vault-graph-wallpaper-desktop-background .workspace-leaf,
+body.vault-graph-wallpaper-desktop-background canvas {
+  background: transparent !important;
+}
+
 /* Optional picture behind the graph. The canvas is transparent, so it shows through.
    Layers, top first: a fixed edge vignette that seats the graph in the scene, the adjustable
    dimming, then the picture. */

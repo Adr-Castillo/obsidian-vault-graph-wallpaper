@@ -20,6 +20,7 @@ const path = require('path');
 const WINDOW_CLASS = 'vault-graph-wallpaper-window';
 const IMAGE_CLASS = 'vault-graph-wallpaper-has-image';
 const UPKEEP_INTERVAL_MS = 10000;
+const WINDOWS_FRAME_MS = 1000 / 30;
 // Frameless Electron windows on Linux have rounded corners; push them just past the screen edge.
 const OVERSCAN_PX = 8;
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
@@ -49,13 +50,14 @@ const DEFAULT_SETTINGS = {
   iconsOnTop: true, // true = sit behind the desktop icons and ignore the mouse (the lightweight default)
   fitPadding: 0.08,
   leafId: null,
-  background: 'theme', // 'theme' | 'image'
+  background: process.platform === 'win32' ? 'desktop' : 'theme',
   backgroundImage: '',
   backgroundDim: 0.2,
   nodeSize: 1,
   returnToFitAfter: 45, // seconds without mouse activity before a zoomed view eases back; 0 = never
   cursorGravity: 0.6, // -1..1: above 0 nodes fall toward the cursor, below 0 they part around it, 0 = off
   gravityRadius: 240, // reach of the cursor's pull, in screen pixels
+  windowsNodeInteraction: true,
   snapshotWallpaper: false,
   previousWallpaper: null,
   loginStart: false,
@@ -227,32 +229,41 @@ function x11(commands, xid) {
   });
 }
 
-// Windows helper (experimental). PowerShell with inline C# re-parents our window into the layer
-// behind the desktop icons — the standard "WorkerW" technique that live-wallpaper tools use, and
-// the only way to reach the desktop layer on Windows, since there is no desktop window type.
-// This is an independent implementation of that public technique. The window ends up behind the
-// icons, which receive the mouse, so on Windows the wallpaper is display-only (no cursor gravity).
+// Windows has no desktop window type. Pin our window below the icons in Explorer's wallpaper
+// layer and observe desktop input without consuming the original mouse events.
 // The helper stays running: it re-pins the window if Explorer restarts, and restores it to a
 // normal window when its stdin closes (the plugin stops it or Obsidian quits).
 const WINDOWS_HELPER = String.raw`
-param([Parameter(Mandatory = $true)][string]$Hwnd)
+param([Parameter(Mandatory = $true)][string]$Hwnd, [int]$TargetX, [int]$TargetY, [switch]$NodeInteraction)
 $ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies System.Windows.Forms, Accessibility -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 public static class VGW {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [StructLayout(LayoutKind.Sequential)]
+    struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Rect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MonitorInfo { public int Size; public Rect Bounds, WorkArea; public uint Flags; }
     [DllImport("user32.dll")] static extern IntPtr FindWindow(string c, string n);
     [DllImport("user32.dll")] static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string n);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
     [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
     [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr c, IntPtr p);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool ScreenToClient(IntPtr h, ref Point p);
     [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int ht, uint f);
-    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int ht, uint f);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
@@ -263,7 +274,7 @@ public static class VGW {
         try { SetProcessDPIAware(); } catch {}
     }
 
-    const int GWL_STYLE = -16, SW_RESTORE = 9, SM_CXSCREEN = 0, SM_CYSCREEN = 1;
+    const int GWL_STYLE = -16, SW_RESTORE = 9;
     const long WS_CHILD = 0x40000000L, WS_POPUP = unchecked((long)0x80000000L), WS_CAPTION = 0x00C00000L,
                WS_THICKFRAME = 0x00040000L, WS_MINIMIZEBOX = 0x00020000L, WS_MAXIMIZEBOX = 0x00010000L, WS_SYSMENU = 0x00080000L;
     const uint SWP_SHOWWINDOW = 0x40, SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20;
@@ -276,6 +287,11 @@ public static class VGW {
         IntPtr res;
         // Tell Explorer to spawn the WorkerW that hosts the wallpaper beneath the icon layer.
         SendMessageTimeout(progman, 0x052C, IntPtr.Zero, IntPtr.Zero, 0x0, 1000, out res);
+        IntPtr icons = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+        if (icons != IntPtr.Zero) {
+            IntPtr nested = FindWindowEx(progman, icons, "WorkerW", null);
+            if (nested != IntPtr.Zero) return nested;
+        }
         IntPtr worker = IntPtr.Zero;
         EnumWindows((hwnd, l) => {
             if (FindWindowEx(hwnd, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
@@ -285,16 +301,28 @@ public static class VGW {
         return worker != IntPtr.Zero ? worker : progman;
     }
 
-    public static void Pin(string s) {
+    public static void Pin(string s, int targetX, int targetY) {
         IntPtr hwnd = new IntPtr(long.Parse(s));
+        IntPtr monitor = MonitorFromPoint(new Point { X = targetX, Y = targetY }, 2);
+        var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
+        if (!GetMonitorInfo(monitor, ref info))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         if (OriginalStyle == 0) OriginalStyle = GetWindowLongPtr(hwnd, GWL_STYLE).ToInt64();
         ShowWindow(hwnd, SW_RESTORE);
         Host = FindWorkerW();
         long child = (OriginalStyle & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_CHILD;
         SetWindowLongPtr(hwnd, GWL_STYLE, new IntPtr(child));
         SetParent(hwnd, Host);
-        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
-            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        if (Host == IntPtr.Zero || GetParent(hwnd) != Host)
+            throw new InvalidOperationException("Explorer did not accept the graph window");
+        Point origin = new Point { X = info.Bounds.Left, Y = info.Bounds.Top };
+        if (!ScreenToClient(Host, ref origin))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        IntPtr icons = FindWindowEx(Host, IntPtr.Zero, "SHELLDLL_DefView", null);
+        if (!SetWindowPos(hwnd, icons, origin.X, origin.Y,
+            info.Bounds.Right - info.Bounds.Left, info.Bounds.Bottom - info.Bounds.Top,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     }
 
     public static void Release(string s) {
@@ -306,13 +334,163 @@ public static class VGW {
 
     public static bool Alive(string s) { return IsWindow(new IntPtr(long.Parse(s))); }
     public static bool Strayed(string s) { return GetParent(new IntPtr(long.Parse(s))) != Host; }
+    public static Task<string> WaitForStop() { return Task.Run(() => Console.ReadLine()); }
+}
+
+// Receive mouse activity without consuming input intended for the desktop.
+public sealed class DesktopMouse : NativeWindow {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Device { public ushort Page, Usage; public uint Flags; public IntPtr Target; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Point { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(Device[] devices, uint count, uint size);
+    [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr raw, uint command, IntPtr data, ref uint size, uint headerSize);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hwnd, ref Point point);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
+    [DllImport("oleacc.dll")] static extern int AccessibleObjectFromPoint(Point point, out Accessibility.IAccessible element, [MarshalAs(UnmanagedType.Struct)] out object child);
+
+    readonly IntPtr graph;
+    readonly IntPtr buffer = Marshal.AllocHGlobal(64);
+    readonly StringBuilder className = new StringBuilder(40);
+    readonly uint headerSize = (uint)(8 + 2 * IntPtr.Size);
+    bool onDesktop;
+    bool panning;
+    bool movingDisplay;
+    Point lastPoint;
+    uint lastMove;
+
+    DesktopMouse(IntPtr hwnd) { graph = hwnd; }
+
+    public static void Start(string hwnd) {
+        var thread = new Thread(() => {
+            try {
+                VGW.UsePhysicalPixels();
+                new DesktopMouse(new IntPtr(long.Parse(hwnd))).Run();
+            } catch (Exception error) {
+                Console.Error.WriteLine("Desktop mouse: " + error.Message);
+            }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+    }
+
+    void Run() {
+        try {
+            CreateHandle(new CreateParams { Parent = new IntPtr(-3) }); // HWND_MESSAGE
+            var device = new Device { Page = 1, Usage = 2, Flags = 0x100, Target = Handle };
+            if (!RegisterRawInputDevices(new[] { device }, 1, (uint)Marshal.SizeOf(typeof(Device))))
+                throw new InvalidOperationException("could not register desktop mouse events");
+            Application.Run();
+        } finally {
+            DestroyHandle();
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    protected override void WndProc(ref Message message) {
+        if (message.Msg == 0x00ff) HandleMouse(message.LParam); // WM_INPUT
+        base.WndProc(ref message);
+    }
+
+    string ClassOf(IntPtr window) {
+        className.Clear();
+        GetClassName(window, className, className.Capacity);
+        return className.ToString();
+    }
+
+    bool IsDesktop(Point point, bool click) {
+        if (MonitorFromPoint(point, 0) != MonitorFromWindow(graph, 0)) return false;
+        IntPtr hit = WindowFromPoint(point);
+        IntPtr root = GetAncestor(hit, 2);
+        string host = ClassOf(root);
+        if (host != "Progman" && host != "WorkerW") return false;
+        if (click && ClassOf(hit) == "SysListView32") {
+            Accessibility.IAccessible element;
+            object child;
+            if (AccessibleObjectFromPoint(point, out element, out child) != 0 || element == null) return false;
+            try {
+                object role = element.get_accRole(child);
+                if (!(role is int)) return false;
+                int id = (int)role;
+                return id == 0x21 || id == 0x0a || id == 0x10; // list, client, or pane
+            } catch (COMException) {
+                return false;
+            } finally { Marshal.ReleaseComObject(element); }
+        }
+        return true;
+    }
+
+    void HandleMouse(IntPtr input) {
+        uint size = 64;
+        uint received = GetRawInputData(input, 0x10000003, buffer, ref size, headerSize);
+        if (received == uint.MaxValue || received < headerSize + 24 ||
+            Marshal.ReadInt32(buffer) != 0) return;
+        int buttons = Marshal.ReadInt16(buffer, (int)headerSize + 4);
+        bool down = (buttons & 1) != 0, up = (buttons & 2) != 0;
+        bool middleDown = (buttons & 0x10) != 0, middleUp = (buttons & 0x20) != 0;
+        bool wheel = (buttons & 0x400) != 0;
+        bool click = down || up || middleDown || middleUp;
+        uint now = unchecked((uint)Environment.TickCount);
+        if (!click && !wheel && unchecked(now - lastMove) < 32) return;
+        lastMove = now;
+        Point point;
+        if (!GetCursorPos(out point)) return;
+        if (movingDisplay) {
+            if (middleUp) {
+                movingDisplay = false;
+                if (MonitorFromPoint(point, 0) != MonitorFromWindow(graph, 0))
+                    Console.WriteLine("display " + point.X + " " + point.Y);
+            }
+            return;
+        }
+        if (!IsDesktop(point, click && !panning)) {
+            if (onDesktop) Console.WriteLine("leave");
+            onDesktop = false;
+            panning = false;
+            return;
+        }
+        if (!ScreenToClient(graph, ref point)) return;
+        if (middleDown && (GetAsyncKeyState(0x10) & 0x8000) != 0) {
+            movingDisplay = true;
+            onDesktop = false;
+            Console.WriteLine("leave");
+            return;
+        }
+        if (!onDesktop || click || wheel || point.X != lastPoint.X || point.Y != lastPoint.Y) {
+            string coords = " " + point.X + " " + point.Y;
+            if (middleDown) {
+                panning = true;
+                Console.WriteLine("pan-start" + coords);
+            } else if (panning) {
+                Console.WriteLine((middleUp ? "pan-end" : "pan") + coords);
+                panning = !middleUp;
+            } else if (wheel) {
+                Console.WriteLine("wheel" + coords + " " + Marshal.ReadInt16(buffer, (int)headerSize + 6));
+            } else {
+                if (down) Console.WriteLine("down" + coords);
+                if (up) Console.WriteLine("up" + coords);
+                if (!click) Console.WriteLine("move" + coords);
+            }
+        }
+        onDesktop = true;
+        lastPoint = point;
+    }
 }
 '@
 [VGW]::UsePhysicalPixels()
-[VGW]::Pin($Hwnd)
-$stop = [Console]::In.ReadLineAsync()
+[VGW]::Pin($Hwnd, $TargetX, $TargetY)
+if ($NodeInteraction) { [DesktopMouse]::Start($Hwnd) }
+[Console]::WriteLine("ready")
+$stop = [VGW]::WaitForStop()
 while ([VGW]::Alive($Hwnd) -and -not $stop.Wait(2000)) {
-    if ([VGW]::Strayed($Hwnd)) { [VGW]::Pin($Hwnd) }  # Explorer restarted; re-pin into the new WorkerW.
+    if ([VGW]::Strayed($Hwnd)) { [VGW]::Pin($Hwnd, $TargetX, $TargetY) }
 }
 if ([VGW]::Alive($Hwnd)) { [VGW]::Release($Hwnd) }
 `;
@@ -397,8 +575,11 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(async () => {
       const restored = this.findRestoredLeaves();
-      if (this.settings.autoStart && this.isSupported()) await this.start(restored.shift());
+      const needsTransparentWindow = this.backgroundMode() === 'desktop';
+      const reusableLeaf = needsTransparentWindow ? undefined : restored.shift();
       for (const leaf of restored) leaf.detach();
+      if (this.settings.autoStart && this.isSupported()) await this.start(reusableLeaf);
+      else reusableLeaf?.detach();
       // Restoring a popout makes Obsidian raise its main window; on a login start, put it away again.
       if (this.loginStarted) this.keepMinimisedAfterLogin();
     });
@@ -446,13 +627,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       // A new window grabs keyboard focus; remember who had it so it can be handed back (X11 only).
       const focused = this.isLinux ? await x11(['active'], 0).catch(() => '0') : '0';
 
-      const leaf =
-        existingLeaf ||
-        this.app.workspace.openPopoutLeaf({
-          x: bounds.x,
-          y: bounds.y,
-          size: { width: bounds.width, height: bounds.height },
-        });
+      const leaf = existingLeaf || this.openWallpaperLeaf(bounds);
       this.leaf = leaf;
       this.settings.leafId = leaf.id || null;
       await this.saveSettings();
@@ -502,6 +677,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       this.lastNodeCount = -1;
       this.hookNodeClicks();
       this.applyRenderOptions();
+      if (this.isWindows) this.limitWindowsRendering();
       await this.pinToDesktop(remote);
       if (this.isLinux) {
         if (focused !== '0' && focused !== this.windowId()) await x11(['activate'], focused).catch(() => {});
@@ -514,6 +690,31 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       await this.stop();
     } finally {
       this.busy = false;
+    }
+  }
+
+  openWallpaperLeaf(bounds) {
+    const position = { x: bounds.x, y: bounds.y, size: { width: bounds.width, height: bounds.height } };
+    if (this.backgroundMode() !== 'desktop') return this.app.workspace.openPopoutLeaf(position);
+
+    // Obsidian creates the graph popout synchronously. Set transparency at
+    // construction time and immediately restore the opener for all other windows.
+    const open = window.open;
+    let intercepted = false;
+    window.open = function (url, name, features) {
+      if (features?.startsWith('token=')) {
+        features += ',background=#00000000,transparent=yes,thickFrame=no,hasShadow=no,focusable=no';
+        intercepted = true;
+      }
+      return open.call(this, url, name, features);
+    };
+    try {
+      const leaf = this.app.workspace.openPopoutLeaf(position);
+      if (intercepted) return leaf;
+      leaf.detach();
+      throw new Error('This Obsidian version could not open a transparent graph window.');
+    } finally {
+      window.open = open;
     }
   }
 
@@ -531,6 +732,10 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   }
 
   forget() {
+    this.restoreWindowsRendering();
+    this.windowsPressedNode = null;
+    this.windowsMouseDown = false;
+    this.windowsPanLast = null;
     this.stopWindowsHelper();
     this.leaf = null;
     this.browserWindow = null;
@@ -578,6 +783,22 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   // Follow resolution and monitor changes, and keep the graph framed as the vault grows.
   upkeep() {
     if (!this.leaf || !this.browserWindow || this.busy) return;
+    if (this.isWindows) {
+      this.limitWindowsRendering();
+      const nodeCount = this.leaf.view?.renderer?.nodes?.length || 0;
+      const elapsed = Date.now() - this.lastPointerAt;
+      const returnToFit = this.userAdjusted && !this.windowsPanLast && this.settings.returnToFitAfter > 0 &&
+        elapsed > this.settings.returnToFitAfter * 1000;
+      if (nodeCount !== this.lastNodeCount) {
+        this.lastNodeCount = nodeCount;
+        if (nodeCount && !this.userAdjusted) this.fitGraph();
+      }
+      if (returnToFit) {
+        this.userAdjusted = false;
+        this.fitGraph(true);
+      }
+      return;
+    }
     // On Windows the helper process owns the window's geometry and stacking; only drive them on X11.
     if (this.isLinux) {
       try {
@@ -636,7 +857,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const screen = remote.screen;
     const displays = screen.getAllDisplays();
     const choice = this.settings.display;
-    if (choice === 'all') {
+    if (choice === 'all' && this.isLinux) {
       const left = Math.min(...displays.map((d) => d.bounds.x));
       const top = Math.min(...displays.map((d) => d.bounds.y));
       const right = Math.max(...displays.map((d) => d.bounds.x + d.bounds.width));
@@ -677,6 +898,8 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     win.setSkipTaskbar(true);
     if (this.isWindows) {
       // Windows has no desktop window type; a helper re-parents the window behind the icons instead.
+      if (this.backgroundMode() === 'desktop') win.setBackgroundColor('#00000000');
+      win.setIgnoreMouseEvents(true);
       await this.startWindowsHelper();
       return;
     }
@@ -703,23 +926,161 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   async startWindowsHelper() {
     this.stopWindowsHelper();
     const hwnd = this.windowId();
-    const file = path.join(this.dataDir(), 'wallpaper-helper.ps1');
+    const vaultId = String(this.app.appId).replace(/[^\w.-]/g, '_');
+    const file = path.join(this.dataDir(), `wallpaper-helper-${vaultId}.ps1`);
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
     await fs.promises.writeFile(file, WINDOWS_HELPER);
+    const remote = electronRemote();
+    const bounds = this.targetBounds(remote);
+    const center = remote.screen.dipToScreenPoint({
+      x: Math.round(bounds.x + bounds.width / 2),
+      y: Math.round(bounds.y + bounds.height / 2),
+    });
+    const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-Hwnd', hwnd,
+      '-TargetX', String(center.x), '-TargetY', String(center.y)];
+    args.push('-NodeInteraction');
     const child = spawn(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-Hwnd', hwnd],
-      { stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true }
+      args,
+      { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
     this.winHelper = child;
+    const lines = require('readline').createInterface({ input: child.stdout });
+    let pinned = false;
+    const ready = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Windows did not pin the graph to the desktop in time.')), 8000);
+      lines.on('line', (line) => {
+        if (line === 'ready') {
+          clearTimeout(timeout);
+          pinned = true;
+          resolve();
+        } else if (this.winHelper === child) {
+          this.handleWindowsPointer(line);
+        }
+      });
+      child.once('exit', () => {
+        clearTimeout(timeout);
+        reject(new Error('Windows could not pin the graph to the desktop.'));
+      });
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
     child.stderr?.on('data', (d) => console.error('Vault Graph Wallpaper helper:', String(d).trim()));
-    child.on('error', (err) => {
-      console.error('Vault Graph Wallpaper: could not run the Windows helper', err);
-      new Notice('Vault Graph Wallpaper: could not start the Windows helper (PowerShell).');
-    });
     child.on('exit', () => {
-      if (this.winHelper === child) this.winHelper = null;
+      if (this.winHelper !== child) return;
+      this.winHelper = null;
+      if (pinned) {
+        new Notice('Vault Graph Wallpaper: the Windows desktop helper stopped.');
+        this.stop({ keepFocus: false }).catch((error) => console.error('Vault Graph Wallpaper: closing the graph', error));
+      }
     });
+    await ready;
+  }
+
+  handleWindowsPointer(line) {
+    const renderer = this.leaf?.view?.renderer;
+    const win = this.leaf?.getContainer()?.win;
+    if (!renderer?.nodes || !win) return;
+    const [event, xText, yText, deltaText] = line.split(' ');
+    const x = Number(xText), y = Number(yText);
+    if (event === 'display' && Number.isFinite(x) && Number.isFinite(y)) {
+      this.moveWallpaperToDisplay(x, y).catch((err) => console.error('Vault Graph Wallpaper: move display', err));
+      return;
+    }
+    const valid = Number.isFinite(x) && Number.isFinite(y) && x >= 0 && y >= 0 &&
+      x < win.innerWidth * win.devicePixelRatio && y < win.innerHeight * win.devicePixelRatio;
+    if (valid) this.lastPointerAt = Date.now();
+    if (event === 'wheel' || event.startsWith('pan-') || event === 'pan') {
+      this.adjustWindowsView(event, valid ? { x, y } : null, Number(deltaText), renderer, win);
+      return;
+    }
+    if (!['move', 'down', 'up', 'leave'].includes(event)) return;
+    if (event === 'leave') this.windowsPanLast = null;
+    if (event === 'down') this.windowsMouseDown = true;
+    if (event === 'up' || event === 'leave') this.windowsMouseDown = false;
+    this.cursor = valid ? { x: x / win.devicePixelRatio, y: y / win.devicePixelRatio, held: this.windowsMouseDown } : null;
+    const node = this.updateWindowsHover(renderer, win);
+    this.wakeGravity();
+    if (event === 'down') this.windowsPressedNode = node ? { id: node.id, x, y } : null;
+    const pressed = this.windowsPressedNode;
+    const moved = pressed && Math.hypot(x - pressed.x, y - pressed.y) > 6;
+    if (event === 'move' && moved) this.windowsPressedNode = null;
+    if (event === 'leave' || event === 'up') {
+      this.windowsPressedNode = null;
+      if (event === 'up' && valid && pressed && !moved) {
+        const file = this.app.vault.getAbstractFileByPath(pressed.id);
+        if (file instanceof TFile) {
+          this.openInMainWindow(file).catch((err) => console.error('Vault Graph Wallpaper: open note', err));
+        }
+      }
+    }
+  }
+
+  adjustWindowsView(event, point, delta, renderer, win) {
+    if (!point) {
+      this.windowsPanLast = null;
+      return;
+    }
+    if (event === 'wheel' && (!Number.isFinite(delta) || delta === 0)) return;
+    this.userAdjusted = true;
+    this.cursor = null;
+    this.updateWindowsHover(renderer, win);
+    this.wakeGravity();
+    if (event === 'wheel') {
+      renderer.onWheel?.({
+        deltaY: -delta,
+        deltaMode: 0,
+        offsetX: point.x / win.devicePixelRatio,
+        offsetY: point.y / win.devicePixelRatio,
+        preventDefault() {},
+      });
+      return;
+    }
+    const last = this.windowsPanLast;
+    if (event !== 'pan-start' && last && (point.x !== last.x || point.y !== last.y)) {
+      renderer.setPan(renderer.panX + point.x - last.x, renderer.panY + point.y - last.y);
+      renderer.changed();
+    }
+    this.windowsPanLast = event === 'pan-end' ? null : point;
+  }
+
+  async moveWallpaperToDisplay(x, y) {
+    if (!this.leaf || this.busy) return;
+    const screen = electronRemote().screen;
+    const display = screen.getDisplayNearestPoint(screen.screenToDipPoint({ x, y }));
+    if (!display || this.settings.display === String(display.id)) return;
+    this.settings.display = String(display.id);
+    await this.saveSettings();
+    await this.restart();
+  }
+
+  updateWindowsHover(renderer, win) {
+    const cursor = this.settings.windowsNodeInteraction ? this.cursor : null;
+    let node = null;
+    if (cursor && renderer.scale > 0) {
+      const x = cursor.x * win.devicePixelRatio, y = cursor.y * win.devicePixelRatio;
+      const graphX = (x - renderer.panX) / renderer.scale;
+      const graphY = (y - renderer.panY) / renderer.scale;
+      let nearest = Infinity;
+      for (const candidate of renderer.nodes) {
+        const dx = graphX - candidate.x, dy = graphY - candidate.y;
+        const distance = dx * dx + dy * dy;
+        const radius = candidate.getSize() * renderer.nodeScale + 2;
+        if (distance < radius * radius && distance < nearest) {
+          node = candidate;
+          nearest = distance;
+        }
+      }
+    }
+    renderer.mouseX = cursor?.x ?? null;
+    renderer.mouseY = cursor?.y ?? null;
+    if (renderer.highlightNode !== node) {
+      renderer.highlightNode = node;
+      renderer.changed();
+    }
+    return node;
   }
 
   // Closing stdin tells the helper to restore the window and exit; kill it if it lingers.
@@ -744,7 +1105,56 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   /* ---------- picture behind the graph ---------- */
 
   backgroundMode() {
+    if (this.isWindows && this.settings.background === 'desktop') return 'desktop';
     return this.settings.background === 'image' && (this.settings.backgroundImage || '').trim() ? 'image' : 'theme';
+  }
+
+  limitWindowsRendering() {
+    const renderer = this.leaf?.view?.renderer;
+    const win = this.leaf?.getContainer()?.win;
+    if (renderer && renderer.renderCallback === this.windowsRendering?.limited) return;
+    this.restoreWindowsRendering();
+    const render = renderer?.renderCallback;
+    if (!win || typeof render !== 'function') return;
+
+    let nextFrame = 0;
+    const state = { renderer, render, timer: null };
+    const limited = () => {
+      const now = win.performance.now();
+      const wait = nextFrame - now;
+      // Give Obsidian its own final callback so it can clear the queue at idle.
+      if (wait > 1 && renderer.px && renderer.idleFrames <= 60) {
+        const timer = win.setTimeout(() => {
+          state.timer = null;
+          limited();
+        }, Math.ceil(wait));
+        state.timer = timer;
+        renderer.cancelRender = () => {
+          win.clearTimeout(timer);
+          state.timer = null;
+        };
+        return;
+      }
+      nextFrame = now + WINDOWS_FRAME_MS;
+      render.call(renderer);
+    };
+    state.limited = limited;
+    this.windowsRendering = state;
+    renderer.renderCallback = limited;
+  }
+
+  restoreWindowsRendering() {
+    const state = this.windowsRendering;
+    if (!state) return;
+    const { renderer, render, limited, timer } = state;
+    if (renderer.renderCallback === limited) {
+      if (timer !== null) {
+        renderer.cancelRender?.();
+        renderer.cancelRender = null;
+      }
+      renderer.renderCallback = render;
+    }
+    this.windowsRendering = null;
   }
 
   // The graph canvas is transparent, so a picture on the element behind it shows through.
@@ -752,7 +1162,9 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     const container = this.leaf?.getContainer();
     const body = container?.doc?.body;
     if (!body) return;
-    if (this.backgroundMode() !== 'image') {
+    const mode = this.backgroundMode();
+    body.classList.toggle('vault-graph-wallpaper-desktop-background', mode === 'desktop');
+    if (mode !== 'image') {
       body.classList.remove(IMAGE_CLASS);
       return;
     }
@@ -886,7 +1298,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     main.show();
     // Ask the window manager directly: a focus request from a background window is easily ignored.
     const xid = /^window:(\d+):/.exec(main.getMediaSourceId())?.[1];
-    if (xid) await x11(['activate'], xid).catch(() => main.focus());
+    if (this.isLinux && xid) await x11(['activate'], xid).catch(() => main.focus());
     else main.focus();
     const workspace = this.app.workspace;
     const recent = workspace.getMostRecentLeaf(workspace.rootSplit);
@@ -941,12 +1353,21 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   }
 
   wakeGravity() {
-    if (this.gravityRunning || !this.leaf || !this.settings.cursorGravity) return;
-    const win = this.leaf.getContainer()?.win;
+    const leaf = this.leaf;
+    if (this.gravityRunning || !leaf || (!this.awake?.size && (!this.settings.cursorGravity || !this.cursor))) return;
+    const win = leaf.getContainer()?.win;
     if (!win) return;
     this.gravityRunning = true;
     this.gravityFrames = 0;
-    animate(win, (dt) => this.gravityStep(dt));
+    let elapsed = 0;
+    animate(win, (dt) => {
+      if (this.leaf !== leaf) return false;
+      elapsed += dt;
+      if (this.isWindows && elapsed < (WINDOWS_FRAME_MS - 1) / 1000) return true;
+      const step = Math.min(elapsed, 0.05);
+      elapsed = 0;
+      return this.gravityStep(step);
+    });
   }
 
   // One frame of the spring simulation. Only touches nodes that are near the cursor or still
@@ -974,9 +1395,12 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
       const awake = this.awake || (this.awake = new Set());
       if (cursor) {
         for (const node of renderer.nodes) {
-          const field = node[FIELD] || this.adoptNode(node);
-          const ox = field.x - cx, oy = field.y - cy;
-          if (ox * ox + oy * oy < pull2) awake.add(node);
+          const origin = node[FIELD] || node;
+          const ox = origin.x - cx, oy = origin.y - cy;
+          if (ox * ox + oy * oy < pull2 && !awake.has(node)) {
+            if (!node[FIELD]) this.adoptNode(node);
+            awake.add(node);
+          }
         }
       }
 
@@ -1016,7 +1440,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
         renderer.changed();
         if (++this.gravityFrames % 6 === 0) this.refreshHover(renderer, win);
       }
-      if (restless === 0 && awake.size === 0) {
+      if (restless === 0) {
         this.gravityRunning = false; // settled; the next pointer move wakes it again
         this.refreshHover(renderer, win);
         return false;
@@ -1031,6 +1455,10 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
   // Replaying the pointer's position lets it pick up the node that is now under the cursor.
   refreshHover(renderer, win) {
     try {
+      if (this.isWindows) {
+        this.updateWindowsHover(renderer, win);
+        return;
+      }
       const target = renderer.interactiveEl;
       if (!this.cursor || this.cursor.held || !target?.dispatchEvent) return;
       target.dispatchEvent(
@@ -1198,6 +1626,7 @@ module.exports = class GraphWallpaperPlugin extends Plugin {
     for (const delay of [1500, 3000, 6000]) {
       await sleep(delay);
       if (this.leaf !== leaf) return;
+      if (this.isWindows) this.limitWindowsRendering();
       this.fitGraph();
     }
   }
@@ -1271,14 +1700,10 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
         })
       );
 
-    // Interactivity and cursor gravity need the window above the icon layer, which only X11 allows.
-    // On Windows the window sits behind the icons (which take the mouse), so it is display-only.
     if (plugin.isWindows) {
-      const note = new Setting(containerEl).setName('Windows support is experimental').setDesc(
-        'The graph is shown behind your desktop icons and updates live, but it is display-only on ' +
-          'Windows — no cursor gravity, zoom or node clicks. Please report problems with your Windows version.'
+      new Setting(containerEl).setName('Windows controls').setDesc(
+        'Scroll to zoom. Middle-drag to pan. Shift + middle-drag to move the wallpaper to another display.'
       );
-      note.settingEl.style.opacity = '0.85';
     }
 
     if (plugin.isLinux) {
@@ -1304,19 +1729,25 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Background')
-      .setDesc('What sits behind the graph: your theme colour, or an image of your own.')
-      .addDropdown((dropdown) =>
+      .setDesc('Choose what shows behind the graph.')
+      .addDropdown((dropdown) => {
+        if (plugin.isWindows) dropdown.addOption('desktop', 'Desktop wallpaper');
         dropdown
           .addOption('theme', 'Theme colour')
           .addOption('image', 'Your image')
           .setValue(plugin.backgroundMode())
           .onChange(async (value) => {
+            const restart = plugin.leaf && (plugin.backgroundMode() === 'desktop' || value === 'desktop');
             s.background = value;
             await plugin.saveSettings();
-            await plugin.applyBackground();
+            if (restart) {
+              await plugin.restart();
+            } else {
+              await plugin.applyBackground();
+            }
             this.display(); // reveal or hide the image and dimming controls
-          })
-      );
+          });
+      });
 
     if (plugin.backgroundMode() === 'image') {
       new Setting(containerEl)
@@ -1335,7 +1766,20 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
         );
     }
 
-    if (plugin.backgroundMode() !== 'theme') {
+    if (plugin.isWindows) {
+      new Setting(containerEl)
+        .setName('Graph node interaction')
+        .setDesc('Highlight nodes on hover and open their notes on click.')
+        .addToggle((toggle) => toggle.setValue(s.windowsNodeInteraction).onChange(async (enabled) => {
+          s.windowsNodeInteraction = enabled;
+          await plugin.saveSettings();
+          const renderer = plugin.leaf?.view?.renderer;
+          const win = plugin.leaf?.getContainer()?.win;
+          if (renderer && win) plugin.updateWindowsHover(renderer, win);
+        }));
+    }
+
+    if (plugin.backgroundMode() === 'image') {
       new Setting(containerEl)
         .setName('Dim background')
         .setDesc('Darken the scene so the nodes and labels stay easy to read.')
@@ -1384,8 +1828,8 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
           })
       );
 
-    // --- Motion (only meaningful while interactive, which is X11-only) ---
-    if (plugin.isLinux && interactive) {
+    // --- Motion ---
+    if ((plugin.isLinux && interactive) || plugin.isWindows) {
       new Setting(containerEl).setName('Motion').setHeading();
 
       new Setting(containerEl)
@@ -1468,21 +1912,21 @@ class GraphWallpaperSettingTab extends PluginSettingTab {
         );
     }
 
-    // --- Display (X11 only; the Windows helper always uses the primary monitor) ---
+    // --- Display ---
     let displays = [];
     try {
       displays = electronRemote().screen.getAllDisplays();
     } catch (err) {
       console.debug('Vault Graph Wallpaper: could not list displays', err);
     }
-    if (plugin.isLinux && displays.length > 1) {
+    if (displays.length > 1) {
       new Setting(containerEl).setName('Display').setHeading();
       new Setting(containerEl)
         .setName('Monitor')
         .setDesc('Which screen the graph covers.')
         .addDropdown((dropdown) => {
           dropdown.addOption('primary', 'Primary monitor');
-          dropdown.addOption('all', 'Span all monitors');
+          if (plugin.isLinux) dropdown.addOption('all', 'Span all monitors');
           for (const d of displays) {
             dropdown.addOption(String(d.id), `${d.label || 'Display'} (${d.bounds.width}×${d.bounds.height})`);
           }
